@@ -32,7 +32,7 @@ their next build, and anyone who would rather show their sketch to an AI than de
 ### Three steps
 
 1. Point a camera down at your desk.
-2. Drag four corner markers onto the corners of your sheet, or let the app find the sheet for you.
+2. Right-click the four corners of your sheet in the camera picture, or let the app find the sheet for you.
 3. Draw. Press **Ctrl+S** whenever you want to keep a copy.
 
 Overhead Camera runs on Linux.
@@ -93,24 +93,33 @@ streams again. Exposure and focus are set in the phone app.
 
 1. **Camera**: pick the device and mode (highest resolution is the default). Under *Camera settings* you can switch
    exposure and white balance to manual for a stable image. Changed values are remembered per camera and re-applied
-   on start.
-2. **Sheet & crop**: drag the four corner handles (TL, TR, BR, BL) onto the paper corners in the camera view, or
-   press *Detect sheet* for a bright sheet on a darker desk. Click a handle and use the arrow keys for pixel-precise
-   placement (Shift = 10 px); a loupe shows the magnified corner. The blue edge becomes the top of the output.
-   *Rotate 90°* / *Mirror* change the orientation. The paper format (A3–A6, US Letter, square, custom, or free from the
+   on start. The buttons above the camera image turn it (*Rotate 90°*), e.g. when the camera looks at the desk from
+   the other side, or *Mirror* it for a camera that delivers mirrored pictures. The corners stay on the sheet:
+   rotating leaves the result as it is, mirroring mirrors it too. The turn is remembered per camera.
+2. **Sheet & crop**: right-click the four paper corners in the camera view, in any order; the first right-click
+   starts a new outline, Esc cancels it. Or press *Detect sheet* for a bright sheet on a darker desk. Drag the corner
+   handles (TL, TR, BR, BL) to adjust them, or click a handle and use the arrow keys for pixel-precise placement
+   (Shift = 10 px); a loupe shows the magnified corner. The blue edge becomes the top of the output.
+   *Rotate result 90°* / *Mirror result* change the orientation of the result. The paper format (A3–A6, US Letter, square, custom, or free from the
    corners; A4 by default) fixes the aspect ratio so the result isn't stretched.
 3. **Noise reduction**: consecutive frames are averaged (temporal stacking). After the first *N* frames this turns into
    a running average, so new strokes keep appearing while you draw.
 4. **Enhancement**: *Even out lighting* divides by an estimate of the bare paper brightness (removes shadows,
    vignetting, color casts), then black/white point, gamma, saturation, sharpening, and grayscale / black & white
    modes. Presets: *Natural*, *Scan*, *Pencil*, *Line art*.
-5. **Export**: *Save PNG* (Ctrl+S) writes `sketch_<timestamp>.png` into the export folder (`~/Pictures/overheadcamera`
-   by default); *Copy* (Ctrl+C) puts the result on the clipboard. *Freeze* (F) stops taking new frames, e.g. to tune
-   the enhancement on a fixed image.
+5. **Export**: *Save* above the result (or Ctrl+S) writes `sketch_<timestamp>.png` into the export folder
+   (`~/Pictures/overheadcamera` by default); *Copy* (or Ctrl+C) puts the result on the clipboard. The camera image has
+   its own *Save* (`camera_<timestamp>.png`, full resolution) and *Copy*. *Freeze* (F) stops taking new frames, e.g.
+   to tune the enhancement on a fixed image.
+
+**Zoom**: scroll over the camera or the result view to zoom in around the pointer, drag to pan, and double-click to
+see the whole image again. While zoomed in, a minimap in the corner shows where you are; click or drag in it to move
+there. Zoomed-in views show the full resolution of the camera and of the result. In *Side by side*, drag the line
+between the two images to give one of them more room; double-click it to center it again.
 
 ### Sharing with AI assistants
 
-Every save also overwrites `latest.png` in the export folder, scaled to at most 1568 px (AI models scale larger images
+Every save also overwrites `latest.png` in the export folder with the saved image, scaled to at most 1568 px (AI models scale larger images
 down anyway, and a smaller file uploads faster). To show your newest sketch to a coding agent such as Claude Code or
 Codex, press Ctrl+S and tell it:
 
@@ -154,11 +163,6 @@ cargo test                                                   # unit tests
 cargo test --release -- --ignored --nocapture camera_smoke   # real camera, writes PNGs to the temp dir
 OVERHEAD_TEST_DEVICE=/dev/video2 cargo test --release -- --ignored --nocapture camera_smoke
 ```
-
-## Ideas
-
-- Zoom and pan in the result view, with a small minimap that shows the whole page and a rectangle marking the zoomed
-  area.
 
 ## License
 

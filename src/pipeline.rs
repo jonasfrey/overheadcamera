@@ -26,7 +26,7 @@ use zune_jpeg::JpegDecoder;
 use crate::{
     camera::{Encoding, RawFrame},
     enhance::{ColorMode, EnhanceSettings, enhance},
-    img::RgbImage,
+    img::{FrameOrientation, RgbImage},
     sheet::SheetSettings,
     stack::Stacker,
     warp::warp,
@@ -70,6 +70,10 @@ struct State {
     stack_depth: u32,
     frozen: bool,
     reset_stack: bool,
+    orientation: FrameOrientation,
+    /// Counts orientation changes; frames are tagged with it so that none turned the old way
+    /// get stacked after a change.
+    orientation_gen: u64,
     stacked: Option<Arc<RgbImage>>,
     stacked_gen: u64,
     preview: Option<ColorImage>,
@@ -106,6 +110,8 @@ impl Pipeline {
                 stack_depth,
                 frozen: false,
                 reset_stack: false,
+                orientation: FrameOrientation::default(),
+                orientation_gen: 0,
                 stacked: None,
                 stacked_gen: 0,
                 preview: None,
@@ -174,6 +180,33 @@ impl Pipeline {
         self.shared.lock().reset_stack = true;
     }
 
+    /// Turns new frames by `orientation`. `change`, the turn from the previous orientation, is
+    /// also applied to the current image right away, so that a frozen image turns as well.
+    pub fn set_orientation(&self, orientation: FrameOrientation, change: Option<FrameOrientation>) {
+        let (stacked, generation) = {
+            let mut st = self.shared.lock();
+            if st.orientation == orientation {
+                return;
+            }
+            st.orientation = orientation;
+            st.orientation_gen += 1;
+            (st.stacked.clone(), st.stacked_gen)
+        };
+        let (Some(change), Some(stacked)) = (change, stacked) else {
+            return;
+        };
+        let turned = Arc::new(stacked.oriented(change));
+        let preview = turned.to_color_image(PREVIEW_MAX_SIDE);
+        let mut st = self.shared.lock();
+        // Unless a frame with the new orientation has arrived meanwhile.
+        if st.stacked_gen == generation {
+            st.stacked = Some(turned);
+            st.stacked_gen += 1;
+            st.preview = Some(preview);
+            self.shared.wake.notify_all();
+        }
+    }
+
     pub fn take_preview(&self) -> Option<ColorImage> {
         self.shared.lock().preview.take()
     }
@@ -216,7 +249,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
 fn decode_thread(
     shared: &Shared,
     frames: &Mutex<Receiver<RawFrame>>,
-    decoded: &SyncSender<RgbImage>,
+    decoded: &SyncSender<(RgbImage, u64)>,
 ) {
     loop {
         let received = frames
@@ -241,7 +274,7 @@ fn decode_thread(
             Err(RecvTimeoutError::Disconnected) => return,
         };
 
-        let frozen = {
+        let (frozen, orientation, orientation_gen) = {
             let mut st = shared.lock();
             if st.stop {
                 return;
@@ -255,7 +288,7 @@ fn decode_thread(
                     st.stats.camera_fps * 0.9 + fps * 0.1
                 };
             }
-            st.frozen
+            (st.frozen, st.orientation, st.orientation_gen)
         };
         if frozen {
             continue;
@@ -264,11 +297,16 @@ fn decode_thread(
         let start = Instant::now();
         match decode(&raw) {
             Ok(frame) => {
+                let frame = if orientation.is_identity() {
+                    frame
+                } else {
+                    frame.oriented(orientation)
+                };
                 let ms = start.elapsed().as_secs_f32() * 1000.0;
                 let mut st = shared.lock();
                 st.stats.decode_ms = st.stats.decode_ms * 0.9 + ms * 0.1;
                 drop(st);
-                match decoded.try_send(frame) {
+                match decoded.try_send((frame, orientation_gen)) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => return,
                 }
@@ -279,10 +317,11 @@ fn decode_thread(
     }
 }
 
-fn stack_thread(shared: &Shared, frames: &Receiver<RgbImage>, ctx: &egui::Context) {
+fn stack_thread(shared: &Shared, frames: &Receiver<(RgbImage, u64)>, ctx: &egui::Context) {
     let mut stacker = Stacker::default();
+    let mut stacker_gen = 0;
     loop {
-        let frame = match frames.recv_timeout(Duration::from_millis(200)) {
+        let (frame, frame_gen) = match frames.recv_timeout(Duration::from_millis(200)) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => {
                 if shared.lock().stop {
@@ -292,18 +331,23 @@ fn stack_thread(shared: &Shared, frames: &Receiver<RgbImage>, ctx: &egui::Contex
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        let (depth, reset, preview_pending) = {
+        let (depth, reset, preview_pending, orientation_gen) = {
             let mut st = shared.lock();
             (
                 st.stack_depth,
                 std::mem::take(&mut st.reset_stack),
                 st.preview.is_some(),
+                st.orientation_gen,
             )
         };
+        if frame_gen != orientation_gen {
+            continue; // Turned the old way.
+        }
 
         let start = Instant::now();
-        if reset {
+        if reset || frame_gen != stacker_gen {
             stacker.reset();
+            stacker_gen = frame_gen;
         }
         let stacked = Arc::new(stacker.push(&frame, depth));
         // Skip building a preview while the UI hasn't even shown the previous one.
