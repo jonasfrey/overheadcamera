@@ -1,0 +1,33 @@
+[package]
+name = "overheadcamera"
+version = "0.1.0"
+edition = "2024"
+authors = ["Jonas Immanuel Frey"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jonasfrey/overheadcamera"
+description = "Live scanner for paper sketches: an overhead webcam or phone, straightened, denoised and cleaned up"
+readme = "README.md"
+keywords = ["webcam", "scanner", "sketch", "document", "egui"]
+categories = ["multimedia::images", "computer-vision"]
+
+[dependencies]
+arboard = "3.7.0"
+chrono = "0.4.45"
+eframe = { version = "0.37.0", features = ["persistence"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+libc = "0.2.191"
+linuxvideo = "0.3.5"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+zune-core = "0.5"
+zune-jpeg = "0.5.15"
+
+# Image processing is far too slow without optimizations, even while developing.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

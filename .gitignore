@@ -1,0 +1,5 @@
+/target
+
+# Local secrets and per-user tool settings
+.env
+.claude/settings.local.json
