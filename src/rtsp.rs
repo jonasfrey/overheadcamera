@@ -1,16 +1,12 @@
 //! Network cameras over RTSP, such as a phone running an IP camera app.
 //!
-//! GStreamer handles the RTSP session, authentication and H.264 decoding in a `gst-launch-1.0`
-//! child process (the pipeline from `phoneascmaera/huawei_rtsp_setup.md`). It sends the decoded
-//! frames back through a pipe as YUV4MPEG2: a header line with the frame size, then per frame a
-//! `FRAME` line followed by the raw I420 planes. Lost connections are retried, so the phone can be
+//! `retina` runs the RTSP session (interleaved over TCP, with digest or basic authentication) and
+//! reassembles the H.264 frames, OpenH264 decodes them into I420 planes. Both are built by cargo,
+//! so nothing has to be installed on the system. Lost connections are retried, so the phone can be
 //! switched on after the app was started.
 
 use std::{
-    collections::VecDeque,
-    io::{self, BufRead, BufReader, Read},
-    os::fd::AsRawFd,
-    process::{ChildStdout, Command, Stdio},
+    pin::pin,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -19,16 +15,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::StreamExt;
+use openh264::{decoder::Decoder, formats::YUVSource};
+use percent_encoding::percent_decode_str;
+use retina::{
+    client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions, Transport},
+    codec::{CodecItem, FrameFormat, ParametersRef},
+};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::camera::{Capture, CaptureStatus, Encoding, Mode, RawFrame};
 
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-/// Connecting (bounded by `tcp-timeout` in the pipeline) plus the RTSP handshake.
-const FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(15);
+/// Fail fast while the phone is off; we retry anyway.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connecting plus the RTSP handshake and the first picture.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 /// The phone app paused or the Wi-Fi dropped without closing the connection.
 const STALL_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_SIDE: usize = 16384;
+/// How often waiting on the network checks whether the capture was stopped.
+const STOP_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -58,15 +65,63 @@ impl StreamSettings {
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host)
     }
+
+    /// The URL without credentials (retina refuses those) and the login: from the username and
+    /// password fields, or else from the URL.
+    fn target(&self) -> Result<(Url, Option<Credentials>), String> {
+        let mut url = Url::parse(self.url.trim()).map_err(|e| format!("Invalid URL: {e}"))?;
+        if url.scheme() != "rtsp" {
+            return Err("The URL has to start with rtsp://".into());
+        }
+        let decode = |s: &str| percent_decode_str(s).decode_utf8_lossy().into_owned();
+        let in_url = Credentials {
+            username: decode(url.username()),
+            password: decode(url.password().unwrap_or_default()),
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        let creds = if !self.username.is_empty() {
+            Some(Credentials {
+                username: self.username.clone(),
+                password: self.password.clone(),
+            })
+        } else if !in_url.username.is_empty() {
+            Some(in_url)
+        } else {
+            None
+        };
+        Ok((url, creds))
+    }
+}
+
+/// Why a connection attempt ended.
+enum Ended {
+    /// The capture was dropped.
+    Stopped,
+    /// A message for the user.
+    Failed(String),
 }
 
 /// Receives the stream, reconnecting whenever it fails, until the capture is dropped.
 pub fn start(settings: StreamSettings, sink: SyncSender<RawFrame>) -> Capture {
     Capture::spawn(move |stop, status| {
+        // The worker thread lets retina finish a TEARDOWN in the background after a session ends.
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("rtsp")
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                status.lock().unwrap().error = Some(format!("Could not start networking: {e}"));
+                return;
+            }
+        };
         while !stop.load(Ordering::Relaxed) {
-            match receive(&settings, &sink, stop, status) {
-                Ok(()) => return,
-                Err(e) => {
+            match runtime.block_on(receive(&settings, &sink, stop, status)) {
+                Ok(()) | Err(Ended::Stopped) => return,
+                Err(Ended::Failed(e)) => {
                     let mut st = status.lock().unwrap();
                     st.running = false;
                     st.error = Some(e);
@@ -80,334 +135,198 @@ pub fn start(settings: StreamSettings, sink: SyncSender<RawFrame>) -> Capture {
     })
 }
 
-/// One connection attempt. `Ok` means stop was requested, `Err` says why the stream ended.
-fn receive(
+/// One connection attempt. `Ok` means the app is shutting down.
+async fn receive(
     settings: &StreamSettings,
     sink: &SyncSender<RawFrame>,
     stop: &AtomicBool,
     status: &Mutex<CaptureStatus>,
-) -> Result<(), String> {
-    let mut child = Command::new("gst-launch-1.0")
-        .arg("-q")
-        .args(pipeline(settings))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => {
-                "GStreamer is not installed (gst-launch-1.0 not found).".to_string()
-            }
-            _ => format!("Could not start GStreamer: {e}"),
-        })?;
-    let stderr = child.stderr.take().unwrap();
-    let log = std::thread::spawn(move || {
-        let mut lines = VecDeque::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                if lines.len() == 40 {
-                    lines.pop_front();
-                }
-                lines.push_back(line);
-            }
+) -> Result<(), Ended> {
+    let host = settings.host();
+    let (url, creds) = settings.target().map_err(Ended::Failed)?;
+    let started = Instant::now();
+    let options = SessionOptions::default()
+        .creds(creds)
+        .user_agent(format!("overheadcamera/{}", env!("CARGO_PKG_VERSION")));
+    let mut session = bounded(
+        Session::describe(url, options),
+        started + CONNECT_TIMEOUT,
+        stop,
+        || unreachable(host),
+    )
+    .await?
+    .map_err(|e| failed(&e, settings))?;
+
+    let streams = session.streams();
+    let Some(video) = streams
+        .iter()
+        .position(|s| s.media() == "video" && s.encoding_name() == "h264")
+    else {
+        let sent: Vec<&str> = streams.iter().map(|s| s.encoding_name()).collect();
+        return Err(Ended::Failed(format!(
+            "{host} sends {}, not H.264. Set the camera app to H.264.",
+            if sent.is_empty() { "nothing".into() } else { sent.join(", ") }
+        )));
+    };
+    let mut deadline = started + FIRST_FRAME_TIMEOUT;
+    let no_video = || format!("No video from {host} (timed out).");
+    let setup = SetupOptions::default()
+        .transport(Transport::Tcp(Default::default()))
+        // Annex B with SPS/PPS before every key frame, the way the decoder takes it.
+        .frame_format(FrameFormat::SIMPLE);
+    bounded(session.setup(video, setup), deadline, stop, no_video)
+        .await?
+        .map_err(|e| failed(&e, settings))?;
+    let session = bounded(session.play(PlayOptions::default()), deadline, stop, no_video)
+        .await?
+        .map_err(|e| failed(&e, settings))?;
+    let mut frames = session.demuxed().map_err(|e| failed(&e, settings))?;
+
+    let mut decoder = Decoder::new()
+        .map_err(|e| Ended::Failed(format!("Could not start the H.264 decoder: {e}")))?;
+    // Decoding has to start at a key frame.
+    let mut synced = false;
+    let mut decode_error = None;
+    let mut size = None;
+    loop {
+        let item = bounded(frames.next(), deadline, stop, || match &decode_error {
+            Some(e) => format!("The video from {host} could not be decoded ({e})."),
+            None => no_video(),
+        })
+        .await?;
+        let frame = match item {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(failed(&e, settings)),
+            None => return Err(Ended::Failed(format!("{host} stopped streaming."))),
+        };
+        synced |= frame.is_random_access_point();
+        if !synced {
+            continue;
         }
-        lines
-    });
-
-    let mut reader = BufReader::with_capacity(
-        1 << 20,
-        PollReader {
-            pipe: child.stdout.take().unwrap(),
-            stop,
-            last_data: Instant::now(),
-            received: false,
-        },
-    );
-    let result = read_frames(&mut reader, sink, status);
-    let _ = child.kill();
-    let _ = child.wait();
-    let log: Vec<String> = log.join().unwrap_or_default().into();
-    if stop.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    // `Ok` here means the pipeline is gone, i.e. the app is shutting down.
-    result.map_err(|e| describe_failure(&e, &log, settings))
-}
-
-/// The pipeline from the setup notes, ending in raw frames on stdout instead of a window.
-fn pipeline(s: &StreamSettings) -> Vec<String> {
-    let mut args = vec![
-        "rtspsrc".to_string(),
-        format!("location={}", quote(s.url.trim())),
-        "latency=50".into(),
-        "protocols=tcp".into(),
-        // Fail fast while the phone is off; we retry anyway.
-        "tcp-timeout=5000000".into(),
-    ];
-    if !s.username.is_empty() {
-        args.push(format!("user-id={}", quote(&s.username)));
-        args.push(format!("user-pw={}", quote(&s.password)));
-    }
-    // Asking for BT.601 makes videoconvert convert whatever colorimetry the phone signals into
-    // the one `decode` expects.
-    let rest = "! rtph264depay ! h264parse ! avdec_h264 ! videoconvert n-threads=4 \
-                ! video/x-raw,format=I420,colorimetry=bt601 ! y4menc ! fdsink fd=1 sync=false";
-    args.extend(rest.split_whitespace().map(String::from));
-    args
-}
-
-/// Quotes a property value for gst-launch's pipeline syntax.
-fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn read_frames(
-    reader: &mut impl BufRead,
-    sink: &SyncSender<RawFrame>,
-    status: &Mutex<CaptureStatus>,
-) -> io::Result<()> {
-    let header = read_header(reader)?;
-    let mut first = true;
-    while let Some(data) = read_frame(reader, &header)? {
-        if first {
-            first = false;
+        let raw = match decoder.decode(frame.data()) {
+            Ok(Some(yuv)) => pack_i420(&yuv),
+            Ok(None) => continue,
+            Err(e) => {
+                // Usually a lost packet; the next key frame recovers.
+                decode_error = Some(e.to_string());
+                continue;
+            }
+        };
+        deadline = Instant::now() + STALL_TIMEOUT;
+        if size != Some((raw.width, raw.height)) {
+            size = Some((raw.width, raw.height));
+            // A frame interval, e.g. (1, 30); unknown leaves the rate at 0.
+            let (interval_num, interval_den) = match frames.streams()[video].parameters() {
+                Some(ParametersRef::Video(p)) => p.frame_rate().unwrap_or_default(),
+                _ => (0, 0),
+            };
             let mut st = status.lock().unwrap();
             st.negotiated = Some(Mode {
                 encoding: Encoding::I420,
-                width: header.width as u32,
-                height: header.height as u32,
-                interval_num: header.fps.1,
-                interval_den: header.fps.0,
+                width: raw.width as u32,
+                height: raw.height as u32,
+                interval_num,
+                interval_den,
             });
             st.running = true;
             st.error = None;
         }
-        let frame = RawFrame {
-            encoding: Encoding::I420,
-            width: header.width,
-            height: header.height,
-            bytes_per_line: header.width,
-            data,
-        };
-        match sink.try_send(frame) {
+        match sink.try_send(raw) {
             // A full queue means processing is behind; dropping keeps latency low.
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
     }
-    Err(io::ErrorKind::UnexpectedEof.into())
 }
 
-#[derive(Debug, PartialEq)]
-struct Y4mHeader {
-    width: usize,
-    height: usize,
-    /// Frame rate as numerator and denominator, 0:0 if unknown.
-    fps: (u32, u32),
-}
-
-impl Y4mHeader {
-    fn frame_len(&self) -> usize {
-        self.width * self.height + 2 * self.width.div_ceil(2) * self.height.div_ceil(2)
-    }
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-/// Reads one header or frame line without the newline; `None` at the end of the stream.
-fn read_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
-    let mut line = Vec::new();
-    reader.by_ref().take(1024).read_until(b'\n', &mut line)?;
-    if line.is_empty() {
-        return Ok(None);
-    }
-    if line.pop() != Some(b'\n') {
-        return Err(invalid("YUV4MPEG2 line too long"));
-    }
-    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
-}
-
-fn read_header(reader: &mut impl BufRead) -> io::Result<Y4mHeader> {
-    let line = read_line(reader)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    let mut tokens = line.split_ascii_whitespace();
-    if tokens.next() != Some("YUV4MPEG2") {
-        return Err(invalid("not a YUV4MPEG2 stream"));
-    }
-    let mut header = Y4mHeader {
-        width: 0,
-        height: 0,
-        fps: (0, 0),
-    };
-    for token in tokens {
-        let mut chars = token.chars();
-        let tag = chars.next();
-        let value = chars.as_str();
-        match tag {
-            Some('W') => header.width = value.parse().map_err(|_| invalid("bad width"))?,
-            Some('H') => header.height = value.parse().map_err(|_| invalid("bad height"))?,
-            Some('F') => {
-                if let Some((num, den)) = value.split_once(':') {
-                    header.fps = (num.parse().unwrap_or(0), den.parse().unwrap_or(0));
-                }
-            }
-            // 420jpeg, 420mpeg2, 420paldv only differ in chroma siting.
-            Some('C') if !value.starts_with("420") => {
-                return Err(invalid(format!("unsupported chroma format {value}")));
-            }
-            _ => {}
+/// Awaits `future`, giving up when the capture is stopped or at `deadline`.
+async fn bounded<F: Future>(
+    future: F,
+    deadline: Instant,
+    stop: &AtomicBool,
+    timeout_message: impl FnOnce() -> String,
+) -> Result<F::Output, Ended> {
+    let mut future = pin!(future);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Ended::Stopped);
         }
-    }
-    if !(1..=MAX_SIDE).contains(&header.width) || !(1..=MAX_SIDE).contains(&header.height) {
-        return Err(invalid("bad frame size"));
-    }
-    Ok(header)
-}
-
-/// Reads the next frame's planes; `None` at the end of the stream.
-fn read_frame(reader: &mut impl BufRead, header: &Y4mHeader) -> io::Result<Option<Vec<u8>>> {
-    let Some(line) = read_line(reader)? else {
-        return Ok(None);
-    };
-    if !line.starts_with("FRAME") {
-        return Err(invalid("lost frame sync in YUV4MPEG2 stream"));
-    }
-    let mut data = vec![0; header.frame_len()];
-    reader.read_exact(&mut data)?;
-    Ok(Some(data))
-}
-
-/// Reads from the GStreamer pipe, giving up when asked to stop or when no data arrives.
-struct PollReader<'a> {
-    pipe: ChildStdout,
-    stop: &'a AtomicBool,
-    last_data: Instant,
-    received: bool,
-}
-
-impl Read for PollReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.stop.load(Ordering::Relaxed) {
-                return Err(io::Error::other("stopped"));
-            }
-            let timeout = if self.received {
-                STALL_TIMEOUT
-            } else {
-                FIRST_DATA_TIMEOUT
-            };
-            if self.last_data.elapsed() > timeout {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let mut pfd = libc::pollfd {
-                fd: self.pipe.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if ready < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
-            }
-            if ready > 0 {
-                let n = self.pipe.read(buf)?;
-                if n > 0 {
-                    self.last_data = Instant::now();
-                    self.received = true;
-                }
-                return Ok(n);
-            }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Ended::Failed(timeout_message()));
+        }
+        if let Ok(output) = tokio::time::timeout(left.min(STOP_POLL), future.as_mut()).await {
+            return Ok(output);
         }
     }
 }
 
-/// Turns GStreamer's error output into a message for the user.
-fn describe_failure(error: &io::Error, log: &[String], settings: &StreamSettings) -> String {
+/// Copies the decoder's padded planes into one tightly packed I420 frame.
+fn pack_i420(yuv: &impl YUVSource) -> RawFrame {
+    let (width, height) = yuv.dimensions();
+    let (y_stride, u_stride, v_stride) = yuv.strides();
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let mut data = Vec::with_capacity(width * height + 2 * chroma_width * chroma_height);
+    for (plane, stride, w, h) in [
+        (yuv.y(), y_stride, width, height),
+        (yuv.u(), u_stride, chroma_width, chroma_height),
+        (yuv.v(), v_stride, chroma_width, chroma_height),
+    ] {
+        // A short plane makes a short frame, which decoding rejects.
+        for row in plane.chunks(stride.max(1)).take(h) {
+            data.extend_from_slice(&row[..w.min(row.len())]);
+        }
+    }
+    RawFrame {
+        encoding: Encoding::I420,
+        width,
+        height,
+        bytes_per_line: width,
+        data,
+    }
+}
+
+fn unreachable(host: &str) -> String {
+    format!(
+        "Can't reach {host}. Is the phone on, in the same Wi-Fi, and the camera app's RTSP server \
+         running?"
+    )
+}
+
+/// Turns a retina error into a message for the user.
+fn failed(error: &retina::Error, settings: &StreamSettings) -> Ended {
     let host = settings.host();
-    let has = |needle: &str| log.iter().any(|l| l.contains(needle));
-    if has("(401)") || has("Unauthorized") {
-        return format!("{host} rejected the login. Check the username and password.");
-    }
-    if has("(404)") {
-        return format!("{host} has no stream at this path. Check the URL.");
-    }
-    if has("Failed to connect") || has("Could not open resource") {
-        return format!(
-            "Can't reach {host}. Is the phone on, in the same Wi-Fi, and the camera app's RTSP \
-             server running?"
-        );
-    }
-    if let Some(line) = log.iter().find(|l| l.contains("no element")) {
-        let element = line.rsplit("no element").next().unwrap_or_default().trim();
-        return format!(
-            "GStreamer is missing the {element} element. Install gstreamer1.0-libav and \
-             gstreamer1.0-plugins-good/-bad."
-        );
-    }
-    if has("not-negotiated") || has("Internal data stream error") {
-        return "The stream could not be decoded. Set the camera app to H.264.".into();
-    }
-    if let Some(line) = log.iter().find(|l| l.starts_with("ERROR")) {
-        let message = line.rsplit(": ").next().unwrap_or(line);
-        return format!("{host}: {message}");
-    }
-    match error.kind() {
-        io::ErrorKind::TimedOut => format!("No video from {host} (timed out)."),
-        io::ErrorKind::UnexpectedEof => format!("{host} stopped streaming."),
-        _ => format!("{host}: {error}"),
-    }
+    Ended::Failed(match error.status_code() {
+        Some(401) => format!("{host} rejected the login. Check the username and password."),
+        Some(404) => format!("{host} has no stream at this path. Check the URL."),
+        _ => {
+            // The first line is the message, the rest is connection and packet context.
+            let text = error.to_string();
+            let message = text.lines().next().unwrap_or_default();
+            if message.starts_with("Unable to connect") {
+                unreachable(host)
+            } else {
+                format!("{host}: {message}")
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use openh264::formats::YUVSlices;
+
     use super::*;
 
     #[test]
-    fn reads_y4m_frames() {
-        let mut stream = b"YUV4MPEG2 W4 H2 F30000:1001 Ip A1:1 C420jpeg XYSCSS=420JPEG\n".to_vec();
-        for v in [10u8, 20] {
-            stream.extend_from_slice(b"FRAME\n");
-            stream.extend(std::iter::repeat_n(v, 4 * 2 + 2 * 2));
-        }
-        let mut reader = &stream[..];
-        let header = read_header(&mut reader).unwrap();
-        assert_eq!(
-            header,
-            Y4mHeader {
-                width: 4,
-                height: 2,
-                fps: (30000, 1001)
-            }
-        );
-        assert_eq!(
-            read_frame(&mut reader, &header).unwrap(),
-            Some(vec![10; 12])
-        );
-        assert_eq!(
-            read_frame(&mut reader, &header).unwrap(),
-            Some(vec![20; 12])
-        );
-        assert_eq!(read_frame(&mut reader, &header).unwrap(), None);
-    }
-
-    #[test]
-    fn odd_sizes_round_chroma_up() {
-        let header = read_header(&mut &b"YUV4MPEG2 W3 H3 C420\n"[..]).unwrap();
-        assert_eq!(header.frame_len(), 9 + 2 * 4);
-    }
-
-    #[test]
-    fn rejects_other_chroma_and_garbage() {
-        assert!(read_header(&mut &b"YUV4MPEG2 W4 H2 C444\n"[..]).is_err());
-        assert!(read_header(&mut &b"RIFF....\n"[..]).is_err());
-        let header = read_header(&mut &b"YUV4MPEG2 W2 H2\n"[..]).unwrap();
-        assert!(read_frame(&mut &b"garbage\n"[..], &header).is_err());
-        // Truncated frame.
-        assert!(read_frame(&mut &b"FRAME\n\x01\x02"[..], &header).is_err());
+    fn packs_padded_planes() {
+        // 4×2 picture in planes padded to a stride of 8 (luma) and 4 (chroma).
+        let y = [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0];
+        let (u, v) = ([9, 10, 0, 0], [11, 12, 0, 0]);
+        let raw = pack_i420(&YUVSlices::new((&y, &u, &v), (4, 2), (8, 4, 4)));
+        assert_eq!((raw.width, raw.height, raw.bytes_per_line), (4, 2, 4));
+        assert_eq!(raw.data, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     }
 
     #[test]
@@ -419,7 +338,56 @@ mod tests {
     }
 
     #[test]
-    fn quotes_gst_values() {
-        assert_eq!(quote(r#"pa"ss\word"#), r#""pa\"ss\\word""#);
+    fn credentials_move_from_url_to_login() {
+        let mut s = StreamSettings {
+            url: " rtsp://me:pa%40ss@phone.local:554/live ".into(),
+            ..Default::default()
+        };
+        let (url, creds) = s.target().unwrap();
+        assert_eq!(url.as_str(), "rtsp://phone.local:554/live");
+        let creds = creds.unwrap();
+        assert_eq!((&*creds.username, &*creds.password), ("me", "pa@ss"));
+
+        // The login fields win over the URL.
+        s.username = "admin".into();
+        s.password = "pw".into();
+        assert_eq!(s.target().unwrap().1.unwrap().username, "admin");
+
+        s.url = "rtsp://phone.local/live".into();
+        s.username.clear();
+        assert!(s.target().unwrap().1.is_none());
+        s.url = "http://phone.local/live".into();
+        assert!(s.target().is_err());
+    }
+
+    /// Receives frames from a real stream: `cargo test --release -- --ignored --nocapture
+    /// stream_smoke`. `OVERHEAD_TEST_RTSP` is the URL (default `rtsp://127.0.0.1:8554/live`).
+    #[test]
+    #[ignore = "needs an RTSP stream"]
+    fn stream_smoke() {
+        let settings = StreamSettings {
+            url: std::env::var("OVERHEAD_TEST_RTSP")
+                .unwrap_or_else(|_| "rtsp://127.0.0.1:8554/live".into()),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let capture = start(settings, tx);
+        let frames = 60;
+        let mut first = None;
+        for _ in 0..frames {
+            let raw = rx.recv_timeout(Duration::from_secs(20)).unwrap_or_else(|e| {
+                panic!("no frame ({e}): {:?}", capture.status.lock().unwrap().error)
+            });
+            first.get_or_insert_with(Instant::now);
+            let chroma = raw.width.div_ceil(2) * raw.height.div_ceil(2);
+            assert_eq!(raw.data.len(), raw.width * raw.height + 2 * chroma);
+        }
+        let elapsed = first.unwrap().elapsed();
+        let mode = capture.status.lock().unwrap().negotiated.unwrap();
+        println!(
+            "{}, received {:.1} fps",
+            mode.label(),
+            (frames - 1) as f64 / elapsed.as_secs_f64()
+        );
     }
 }

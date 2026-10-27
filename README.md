@@ -45,7 +45,8 @@ You need:
 
 - **Linux** with a desktop. Windows and macOS are not supported (the app talks to cameras through Linux's V4L2).
 - **A camera:** a USB webcam mounted above the desk, or a phone (see [Using a phone](#using-a-phone-as-the-camera)).
-- **Rust** to build the app, installed with [rustup](https://rustup.rs).
+- **Rust** to build the app, installed with [rustup](https://rustup.rs), and a C/C++ compiler (on Ubuntu:
+  `sudo apt install build-essential`).
 
 Then:
 
@@ -76,12 +77,10 @@ cargo install --path .
 Any phone app that streams the camera as RTSP with H.264 video works. Tested with *IP Camera* by ShenYao on a Huawei
 phone; [phoneascmaera/huawei_rtsp_setup.md](phoneascmaera/huawei_rtsp_setup.md) lists the settings.
 
-1. Install GStreamer on the computer. On Ubuntu, Linux Mint and Debian:
-   ```sh
-   sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
-   ```
-2. Start the RTSP server in the phone app (phone and computer in the same Wi‑Fi).
-3. In Overhead Camera, pick *Phone / network stream (RTSP)* as the camera, enter the URL, username and password shown
+Nothing extra has to be installed on the computer: the stream is received and decoded by the app itself.
+
+1. Start the RTSP server in the phone app (phone and computer in the same Wi‑Fi).
+2. In Overhead Camera, pick *Phone / network stream (RTSP)* as the camera, enter the URL, username and password shown
    in the phone app, and press *Connect*.
 
 If the phone is off or the stream drops, the app keeps retrying every few seconds and continues as soon as the phone
@@ -138,7 +137,8 @@ plain text.
 ## Under the hood
 
 Rust + [egui](https://github.com/emilk/egui) (eframe). Cameras are read directly through V4L2 (MJPEG and YUYV); the
-phone stream is received by running `gst-launch-1.0`, which hands decoded frames to the app as YUV4MPEG2. Decoding,
+phone stream is received with [retina](https://github.com/scottlamb/retina) (RTSP) and decoded with
+[OpenH264](https://github.com/cisco/openh264), which cargo builds from source along with the app. Decoding,
 stacking and the perspective correction + enhancement each run on their own threads, so the interface stays smooth
 even with 4K input.
 
@@ -147,7 +147,7 @@ even with 4K input.
 | `src/main.rs` | window setup |
 | `src/app.rs` | egui UI |
 | `src/camera.rs` | device/mode discovery, capture thread, camera controls |
-| `src/rtsp.rs` | phone / RTSP source: runs GStreamer, reads its YUV4MPEG2 output, reconnects |
+| `src/rtsp.rs` | phone / RTSP source: RTSP session, H.264 decoding, reconnects |
 | `src/pipeline.rs` | worker threads: JPEG/YUYV/I420 decode, stacking, rectify + enhance |
 | `src/stack.rs` | frame averaging |
 | `src/warp.rs` | homography + bilinear/bicubic perspective warp |
@@ -162,6 +162,7 @@ even with 4K input.
 cargo test                                                   # unit tests
 cargo test --release -- --ignored --nocapture camera_smoke   # real camera, writes PNGs to the temp dir
 OVERHEAD_TEST_DEVICE=/dev/video2 cargo test --release -- --ignored --nocapture camera_smoke
+OVERHEAD_TEST_RTSP=rtsp://user:pw@192.168.1.52:8554/live cargo test --release -- --ignored --nocapture stream_smoke
 ```
 
 ## License
