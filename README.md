@@ -93,8 +93,9 @@ streams again. Exposure and focus are set in the phone app.
 1. **Camera**: pick the device and mode (highest resolution is the default). Under *Camera settings* you can switch
    exposure and white balance to manual for a stable image. Changed values are remembered per camera and re-applied
    on start. The buttons above the camera image turn it (*Rotate 90°*), e.g. when the camera looks at the desk from
-   the other side, or *Mirror* it for a camera that delivers mirrored pictures. The corners stay on the sheet:
-   rotating leaves the result as it is, mirroring mirrors it too. The turn is remembered per camera.
+   the other side, or *Mirror* it for a camera that delivers mirrored pictures. The corners stay on the sheet and
+   the result turns with the camera image, so rotating gives you a turned page and mirroring a mirrored one. The
+   turn is remembered per camera.
 2. **Sheet & crop**: right-click the four paper corners in the camera view, in any order; the first right-click
    starts a new outline, Esc cancels it. Or press *Detect sheet* for a bright sheet on a darker desk. Drag the corner
    handles (TL, TR, BR, BL) to adjust them, or click a handle and use the arrow keys for pixel-precise placement

@@ -584,12 +584,12 @@ impl OverheadApp {
         Some((frame.width as f32, frame.height as f32))
     }
 
-    /// Turns the camera image a quarter turn clockwise. The corners stay on the sheet, so the
-    /// result keeps its orientation.
+    /// Turns the camera image and the result a quarter turn clockwise. The corners stay on the
+    /// sheet while the result turns with the camera image.
     fn rotate_camera(&mut self, ctx: &egui::Context) {
         let turn = |[x, y]: [f32; 2]| [1.0 - y, x];
         self.settings.orientation = self.settings.orientation.rotated();
-        self.settings.corners = self.settings.corners.map(turn);
+        self.settings.corners = rotated_corners(self.settings.corners);
         self.turned_camera(ctx, turn, FrameOrientation::QUARTER_TURN);
     }
 
@@ -1339,8 +1339,8 @@ impl OverheadApp {
             rotate = ui
                 .button("Rotate 90°")
                 .on_hover_text(
-                    "Turn the camera image clockwise. The corners stay on the sheet, so the \
-                     result keeps its orientation.",
+                    "Turn the camera image and the result clockwise. The corners stay on the \
+                     sheet.",
                 )
                 .clicked();
             mirror = ui
@@ -1754,6 +1754,14 @@ fn nearest_corner(pts: &[Pos2; 4], pos: Pos2) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Moves the corners along with a quarter turn of the camera image and reorders them so that the
+/// result turns clockwise too instead of keeping its orientation.
+fn rotated_corners(corners: [[f32; 2]; 4]) -> [[f32; 2]; 4] {
+    let turn = |[x, y]: [f32; 2]| [1.0 - y, x];
+    let c = corners.map(turn);
+    [c[3], c[0], c[1], c[2]]
+}
+
 /// Puts corners clicked in any order into TL, TR, BR, BL order, judged in the pixels of an image
 /// of `size`.
 fn order_normalized(corners: [[f32; 2]; 4], size: Vec2) -> [[f32; 2]; 4] {
@@ -1949,6 +1957,16 @@ mod tests {
         zp.clamp(view, size);
         assert_eq!(zp.zoom, 1.0);
         assert_eq!(zp.center, vec2(0.5, 0.5));
+    }
+
+    #[test]
+    fn rotated_corners_turn_the_result_clockwise() {
+        let corners = [[0.125, 0.25], [0.75, 0.25], [0.75, 0.875], [0.125, 0.875]];
+        // The old bottom-left corner becomes the result's top-left, so the result turns clockwise.
+        assert_eq!(
+            rotated_corners(corners),
+            [[0.125, 0.125], [0.75, 0.125], [0.75, 0.75], [0.125, 0.75]]
+        );
     }
 
     #[test]
