@@ -427,6 +427,9 @@ impl OverheadApp {
         };
         app.pipeline.set_orientation(app.settings.orientation, None);
         app.rescan_devices();
+        if app.settings.use_stream {
+            app.start_stream();
+        }
         app
     }
 
@@ -438,7 +441,9 @@ impl OverheadApp {
         });
     }
 
+    /// Refreshes the camera list and restarts the camera, unless it was stopped.
     fn rescan_devices(&mut self) {
+        let stopped = self.stopped();
         let current = self.device.map(|i| self.devices[i].path.clone());
         if !self.settings.use_stream {
             // Release the current device first so it enumerates normally.
@@ -448,9 +453,6 @@ impl OverheadApp {
         self.devices = list_devices();
         self.device = None;
         if self.settings.use_stream {
-            if self.capture.is_none() {
-                self.start_stream();
-            }
             return;
         }
 
@@ -469,6 +471,7 @@ impl OverheadApp {
             })
             .or((!self.devices.is_empty()).then_some(0));
         match index {
+            Some(i) if stopped => self.device = Some(i),
             Some(i) => self.start_camera(i, self.settings.mode),
             None => self.set_status(
                 "No camera found. Plug one in and press \"Rescan\", or pick the phone stream.",
@@ -535,6 +538,17 @@ impl OverheadApp {
         ));
     }
 
+    /// Closes the camera or stream right away and doesn't retry. The last image stays.
+    fn stop_capture(&mut self) {
+        self.capture = None;
+        self.controls = None;
+    }
+
+    /// Whether the user stopped the selected source.
+    fn stopped(&self) -> bool {
+        self.capture.is_none() && (self.settings.use_stream || self.device.is_some())
+    }
+
     /// Remembers the corners of the source being left and restores those of the new one.
     fn switch_source(&mut self, key: String) {
         self.remember_corners();
@@ -568,7 +582,15 @@ impl OverheadApp {
 
     /// Why the source delivers no frames right now, if it doesn't.
     fn capture_problem(&self) -> Option<String> {
-        let status = self.capture.as_ref()?.status.lock().unwrap().clone();
+        let Some(capture) = &self.capture else {
+            let text = if self.settings.use_stream {
+                "Disconnected. Press \"Connect\" on the left to receive the stream again."
+            } else {
+                "Camera stopped. Press \"Start\" on the left to use it again."
+            };
+            return self.stopped().then(|| text.into());
+        };
+        let status = capture.status.lock().unwrap().clone();
         if status.running {
             return None;
         }
@@ -895,9 +917,33 @@ impl OverheadApp {
         let error = status
             .as_ref()
             .and_then(|s| s.error.clone().filter(|_| !s.running));
+        let stopped = self.stopped();
+        let (mut stop, mut start) = (false, false);
         ui.horizontal(|ui| {
             if ui.button("Rescan").clicked() {
                 self.rescan_devices();
+            }
+            if !use_stream && self.device.is_some() {
+                if stopped {
+                    start = ui.button("Start").clicked();
+                } else {
+                    stop = ui
+                        .button("Stop")
+                        .on_hover_text(
+                            "Stop the camera and release it for other applications; the last \
+                             image stays",
+                        )
+                        .clicked();
+                }
+            }
+            if stopped {
+                let text = if use_stream {
+                    "disconnected"
+                } else {
+                    "stopped"
+                };
+                ui.label(RichText::new(text).weak());
+                return;
             }
             let Some(status) = status.filter(|_| error.is_none()) else {
                 return;
@@ -928,6 +974,10 @@ impl OverheadApp {
             self.start_stream();
         } else if let (Some(i), Some(m)) = (self.device, new_mode) {
             self.start_camera(i, Some(m));
+        } else if stop {
+            self.stop_capture();
+        } else if let (Some(i), true) = (self.device, start) {
+            self.start_camera(i, self.settings.mode);
         }
 
         egui::CollapsingHeader::new("Camera settings (exposure, white balance, …)")
@@ -955,10 +1005,22 @@ impl OverheadApp {
             field(ui, "Password", &mut draft.password, true);
         });
         let changed = self.stream_draft != self.settings.stream;
+        let connected = self.capture.is_some();
+        let mut disconnect = false;
         ui.horizontal(|ui| {
             submit |= ui
-                .button(if changed { "Connect" } else { "Reconnect" })
+                .button(if changed || !connected {
+                    "Connect"
+                } else {
+                    "Reconnect"
+                })
                 .clicked();
+            if connected {
+                disconnect = ui
+                    .button("Disconnect")
+                    .on_hover_text("Close the connection and stop retrying; the last image stays")
+                    .clicked();
+            }
             if changed && ui.button("Undo").clicked() {
                 self.stream_draft = self.settings.stream.clone();
             }
@@ -966,6 +1028,8 @@ impl OverheadApp {
         if submit {
             self.settings.stream = self.stream_draft.clone();
             self.start_stream();
+        } else if disconnect {
+            self.stop_capture();
         }
         ui.label(
             RichText::new(
@@ -980,6 +1044,8 @@ impl OverheadApp {
         let Some(controls) = &mut self.controls else {
             ui.label(if self.settings.use_stream {
                 "Set exposure, focus and white balance in the phone app."
+            } else if self.stopped() {
+                "Start the camera to change its settings."
             } else {
                 "Not available for this camera."
             });
@@ -1408,7 +1474,7 @@ impl OverheadApp {
                 .capture
                 .as_ref()
                 .and_then(|c| c.status.lock().unwrap().error.clone());
-            let text = if self.settings.use_stream {
+            let text = if self.settings.use_stream || self.stopped() {
                 self.capture_problem()
                     .unwrap_or_else(|| "Waiting for the stream…".into())
             } else if self.devices.is_empty() {

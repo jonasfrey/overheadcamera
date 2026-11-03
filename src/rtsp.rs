@@ -125,7 +125,7 @@ pub fn start(
         };
         while !stop.load(Ordering::Relaxed) {
             match runtime.block_on(receive(&settings, &sink, &paused, stop, status)) {
-                Ok(()) | Err(Ended::Stopped) => return,
+                Ok(()) | Err(Ended::Stopped) => break,
                 Err(Ended::Failed(e)) => {
                     let mut st = status.lock().unwrap();
                     st.running = false;
@@ -137,6 +137,9 @@ pub fn start(
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        // Dropping the runtime would wait for a host name lookup in progress, which can take
+        // seconds when the name doesn't resolve, and the UI waits for this thread.
+        runtime.shutdown_background();
     })
 }
 
@@ -371,6 +374,22 @@ mod tests {
         assert!(s.target().unwrap().1.is_none());
         s.url = "http://phone.local/live".into();
         assert!(s.target().is_err());
+    }
+
+    #[test]
+    fn stops_promptly_while_looking_up_the_host() {
+        // A missing `.local` name goes to mDNS, which takes seconds to give up.
+        let settings = StreamSettings {
+            url: "rtsp://no-such-camera-overheadcamera-test.local:8554/live".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(2);
+        let capture = start(settings, tx, Default::default());
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        drop(capture);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "stopping took {took:?}");
     }
 
     /// Receives frames from a real stream: `cargo test --release -- --ignored --nocapture
