@@ -22,7 +22,8 @@ sharp, evenly lit, and updated with every line you add. When you like what you s
 - **Ready to share.** Save or copy with a single shortcut and paste the sketch into a document, a chat or a slide, or
   hand it straight to an AI assistant such as Claude or ChatGPT to discuss it or build on it.
 - **Private and free.** Everything runs on your own computer. No account, no cloud, no subscription,
-  and the code is open source.
+  and the code is open source. The optional AI redraw and description only send the result to an
+  online service when you switch them on.
 
 ### Made for
 
@@ -127,11 +128,32 @@ Codex, press Ctrl+S and tell it:
 look at ~/Pictures/overheadcamera/latest.png
 ```
 
+### Redraw and describe with AI (optional, online)
+
+Two toggles above the result send the current result to an online model and show its answer over the result:
+
+- **Image-to-image** redraws the sketch with an image model ([fal.ai](https://fal.ai), Google's
+  *nano-banana-2.1* by default). By default it is restyled as a Leonardo da Vinci notebook drawing, with the
+  composition and all handwriting kept. The redrawn image lies over your result; the *Opacity* slider below the
+  buttons blends between the two.
+- **Image-to-text** asks a vision model ([DeepSeek](https://platform.deepseek.com), *deepseek-flash* by default)
+  about the sketch. Its answer appears in a box over the result, ready to select or copy.
+
+Each time you switch one on, it runs again on the current result; switching it off hides the answer. While a
+request runs, a box in the middle of the result shows its progress and a *Cancel* button.
+
+Every successful run is kept in the export folder, in a folder named after its start time and mode, e.g.
+`2026-11-03_18_30_05_image-to-image`. It holds the image exactly as it was sent (`input.jpg`), the prompt
+(`prompt.txt`) and the answer (`output.png` or `output.txt`).
+
+Under *Inference* on the left, enter the API key of each service (or set `FAL_KEY` and `DEEPSEEK_API_KEY` before
+starting the app), and change the prompt, the model or the output resolution. Both services charge per request.
+
 ### Settings
 
 Corners and all settings are saved on exit in `~/.local/share/overheadcamera/app.ron`. Corners are kept per source, so
-switching between the overhead camera and the phone restores each one's crop. The stream password is stored there in
-plain text.
+switching between the overhead camera and the phone restores each one's crop. The stream password and the API keys
+are stored there in plain text.
 
 ---
 
@@ -156,6 +178,7 @@ even with 4K input.
 | `src/enhance.rs` | lighting correction, levels, sharpening, color modes |
 | `src/detect.rs` | automatic sheet detection |
 | `src/img.rs` | image buffer types |
+| `src/inference.rs` | image-to-image (fal.ai) and image-to-text (DeepSeek) requests |
 
 ### Tests
 
@@ -164,6 +187,7 @@ cargo test                                                   # unit tests
 cargo test --release -- --ignored --nocapture camera_smoke   # real camera, writes PNGs to the temp dir
 OVERHEAD_TEST_DEVICE=/dev/video2 cargo test --release -- --ignored --nocapture camera_smoke
 OVERHEAD_TEST_RTSP=rtsp://user:pw@192.168.1.52:8554/live cargo test --release -- --ignored --nocapture stream_smoke
+FAL_KEY=… DEEPSEEK_API_KEY=… cargo test -- --ignored --nocapture inference_smoke  # real APIs, costs a little
 ```
 
 ## License

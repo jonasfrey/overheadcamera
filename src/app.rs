@@ -10,7 +10,7 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, ComboBox, CornerRadius, CursorIcon, FontId, Key,
+    self, Align, Align2, Color32, ColorImage, ComboBox, CornerRadius, CursorIcon, FontId, Key,
     KeyboardShortcut, Mesh, Modifiers, PointerButton, Pos2, ProgressBar, Rect, Response, RichText,
     Sense, Shape, Slider, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
 };
@@ -21,6 +21,10 @@ use crate::{
     detect::{detect_sheet, order_corners},
     enhance::{ColorMode, EnhanceSettings},
     img::{FrameOrientation, RgbImage},
+    inference::{
+        self, DEFAULT_IMAGE_PROMPT, DEFAULT_TEXT_PROMPT, Finished, InferenceSettings, Resolution,
+        Task,
+    },
     pipeline::{Pipeline, ProcessSettings},
     rtsp::{self, StreamSettings},
     sheet::{MAX_OUTPUT_SIDE, Orientation, Paper, SheetSettings},
@@ -86,6 +90,7 @@ struct Settings {
     view: View,
     /// Where the divider between camera and result sits in the side-by-side view (0..1).
     split: f32,
+    inference: InferenceSettings,
 }
 
 impl Default for Settings {
@@ -107,6 +112,7 @@ impl Default for Settings {
             output_dir: default_output_dir(),
             view: View::Both,
             split: 0.5,
+            inference: InferenceSettings::default(),
         }
     }
 }
@@ -382,6 +388,12 @@ pub struct OverheadApp {
     placing: Vec<[f32; 2]>,
     camera_zoom: ZoomPan,
     result_zoom: ZoomPan,
+    /// Image-to-image: the result redrawn by the image model, shown over the result.
+    image_task: Task<Finished<ColorImage>, TextureHandle>,
+    /// How the result was turned since image-to-image was started; the redrawn image turns along.
+    image_turn: FrameOrientation,
+    /// Image-to-text: the vision model's answer about the result.
+    text_task: Task<Finished<String>, String>,
     status: Option<Status>,
     jobs_tx: Sender<JobResult>,
     jobs_rx: Receiver<JobResult>,
@@ -420,6 +432,9 @@ impl OverheadApp {
             placing: Vec::new(),
             camera_zoom: ZoomPan::default(),
             result_zoom: ZoomPan::default(),
+            image_task: Task::Off,
+            image_turn: FrameOrientation::default(),
+            text_task: Task::Off,
             status: None,
             jobs_tx,
             jobs_rx,
@@ -616,6 +631,7 @@ impl OverheadApp {
         let turn = |[x, y]: [f32; 2]| [1.0 - y, x];
         self.settings.orientation = self.settings.orientation.rotated();
         self.settings.corners = rotated_corners(self.settings.corners);
+        self.image_turn = self.image_turn.rotated();
         self.turned_camera(ctx, turn, FrameOrientation::QUARTER_TURN);
     }
 
@@ -626,6 +642,7 @@ impl OverheadApp {
         self.settings.orientation = self.settings.orientation.mirrored();
         let c = self.settings.corners.map(flip);
         self.settings.corners = [c[1], c[0], c[3], c[2]];
+        self.image_turn = self.image_turn.mirrored();
         self.turned_camera(ctx, flip, FrameOrientation::MIRROR);
     }
 
@@ -665,6 +682,21 @@ impl OverheadApp {
                 }
             }
             self.result = Some((processed.image, processed.grayscale));
+        }
+        let mut saved = Vec::new();
+        self.image_task.poll(|run| {
+            saved.push(("Image-to-image", run.saved));
+            ctx.load_texture("image-to-image", run.output, TextureOptions::LINEAR)
+        });
+        self.text_task.poll(|run| {
+            saved.push(("Image-to-text", run.saved));
+            run.output
+        });
+        for (mode, saved) in saved {
+            match saved {
+                Ok(dir) => self.set_status(format!("{mode} saved in {}", dir.display()), false),
+                Err(e) => self.set_status(format!("{mode} finished, but saving failed: {e}"), true),
+            }
         }
         while let Ok(job) = self.jobs_rx.try_recv() {
             match job {
@@ -745,6 +777,38 @@ impl OverheadApp {
     fn set_frozen(&mut self, frozen: bool) {
         self.frozen = frozen;
         self.pipeline.set_frozen(frozen);
+    }
+
+    /// Switching image-to-image on sends the current result to the image model; switching it off
+    /// hides the redrawn image or cancels the request.
+    fn set_image_inference(&mut self, ctx: &egui::Context, on: bool) {
+        self.image_turn = FrameOrientation::default();
+        self.image_task = match (on, self.result.clone()) {
+            (false, _) => Task::Off,
+            (true, None) => Task::Failed("There is no result to redraw yet.".into()),
+            (true, Some((image, gray))) => Task::Running(inference::image_to_image(
+                ctx.clone(),
+                image,
+                gray,
+                self.settings.inference.image.clone(),
+                expand_home(&self.settings.output_dir),
+            )),
+        };
+    }
+
+    /// Like [`Self::set_image_inference`], for image-to-text.
+    fn set_text_inference(&mut self, ctx: &egui::Context, on: bool) {
+        self.text_task = match (on, self.result.clone()) {
+            (false, _) => Task::Off,
+            (true, None) => Task::Failed("There is no result to describe yet.".into()),
+            (true, Some((image, gray))) => Task::Running(inference::image_to_text(
+                ctx.clone(),
+                image,
+                gray,
+                self.settings.inference.text.clone(),
+                expand_home(&self.settings.output_dir),
+            )),
+        };
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -862,6 +926,9 @@ impl OverheadApp {
         egui::CollapsingHeader::new(RichText::new("Export").strong())
             .default_open(true)
             .show(ui, |ui| self.export_section(ui));
+        egui::CollapsingHeader::new(RichText::new("Inference").strong())
+            .default_open(true)
+            .show(ui, |ui| self.inference_section(ui));
     }
 
     fn camera_section(&mut self, ui: &mut Ui) {
@@ -1215,9 +1282,11 @@ impl OverheadApp {
                 .clicked()
             {
                 self.settings.corners = [c[3], c[0], c[1], c[2]];
+                self.image_turn = self.image_turn.rotated();
             }
             if ui.button("Mirror result").clicked() {
                 self.settings.corners = [c[1], c[0], c[3], c[2]];
+                self.image_turn = self.image_turn.mirrored();
             }
             if ui.button("Reset corners").clicked() {
                 self.settings.corners = DEFAULT_CORNERS;
@@ -1348,6 +1417,76 @@ impl OverheadApp {
         );
     }
 
+    fn inference_section(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new(
+                "Image-to-image and Image-to-text above the result send the current result to \
+                 these online services and show their answer over it. Keys are stored in plain \
+                 text with the other settings.",
+            )
+            .weak(),
+        );
+        let field_width = ui.available_width() - 90.0;
+        let s = &mut self.settings.inference;
+
+        ui.add_space(4.0);
+        ui.label(RichText::new("Image-to-image (fal.ai)").strong());
+        egui::Grid::new("image inference")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("API key");
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.image.api_key)
+                        .password(true)
+                        .hint_text("or set $FAL_KEY")
+                        .desired_width(field_width),
+                );
+                ui.end_row();
+                ui.label("Model");
+                ui.add(egui::TextEdit::singleline(&mut s.image.model).desired_width(field_width))
+                    .on_hover_text(
+                        "A fal.ai image editing endpoint that takes prompt and image_urls",
+                    );
+                ui.end_row();
+                ui.label("Resolution");
+                ComboBox::from_id_salt("image resolution")
+                    .selected_text(s.image.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for r in Resolution::ALL {
+                            ui.selectable_value(&mut s.image.resolution, r, r.label());
+                        }
+                    });
+                ui.end_row();
+            });
+        prompt_editor(
+            ui,
+            "image prompt",
+            &mut s.image.prompt,
+            DEFAULT_IMAGE_PROMPT,
+        );
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Image-to-text (DeepSeek)").strong());
+        egui::Grid::new("text inference")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("API key");
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.text.api_key)
+                        .password(true)
+                        .hint_text("or set $DEEPSEEK_API_KEY")
+                        .desired_width(field_width),
+                );
+                ui.end_row();
+                ui.label("Model");
+                ui.add(egui::TextEdit::singleline(&mut s.text.model).desired_width(field_width));
+                ui.end_row();
+            });
+        ui.checkbox(&mut s.text.thinking, "Think before answering")
+            .on_hover_text("More careful answers, but slower and more expensive");
+        prompt_editor(ui, "text prompt", &mut s.text.prompt, DEFAULT_TEXT_PROMPT);
+    }
+
     fn central(&mut self, ui: &mut Ui) {
         let rect = ui.available_rect_before_wrap();
         match self.settings.view {
@@ -1443,8 +1582,10 @@ impl OverheadApp {
 
     /// The result with its buttons above it.
     fn result_pane(&mut self, ui: &mut Ui, rect: Rect) {
-        let (bar, view) = rect.split_top_bottom_at_y(rect.top() + VIEW_BAR_HEIGHT);
+        let (bar, rest) = rect.split_top_bottom_at_y(rect.top() + VIEW_BAR_HEIGHT);
         let [mut copy, mut save] = [false; 2];
+        let (image_was_on, text_was_on) = (self.image_task.is_on(), self.text_task.is_on());
+        let (mut image_on, mut text_on) = (image_was_on, text_was_on);
         view_bar(ui, bar, "Result", |ui| {
             copy = ui
                 .button("Copy")
@@ -1454,7 +1595,37 @@ impl OverheadApp {
                 .button("Save")
                 .on_hover_text("Save the result as PNG in the export folder (Ctrl+S)")
                 .clicked();
+            ui.toggle_value(&mut image_on, "Image-to-image")
+                .on_hover_text(
+                    "Redraw the result with the image model (prompt under Inference on the left) \
+                     and show it over the result. Every time it is switched on, it runs again.",
+                );
+            ui.toggle_value(&mut text_on, "Image-to-text")
+                .on_hover_text(
+                    "Ask the vision model about the result and show its answer over it. Every \
+                     time it is switched on, it runs again.",
+                );
         });
+        // The redrawn image's opacity, in a second row while image-to-image is on.
+        let view = if image_on {
+            let (row, view) = rest.split_top_bottom_at_y(rest.top() + VIEW_BAR_HEIGHT);
+            let layout = egui::Layout::left_to_right(Align::Center);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(row).layout(layout), |ui| {
+                ui.label("Opacity");
+                ui.add(
+                    Slider::new(&mut self.settings.inference.opacity, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                        .custom_parser(|s| {
+                            let percent = s.trim().trim_end_matches('%').trim();
+                            percent.parse::<f64>().ok().map(|p| p / 100.0)
+                        }),
+                )
+                .on_hover_text("0 % shows only your result, 100 % only the redrawn image");
+            });
+            view
+        } else {
+            rest
+        };
         let ctx = ui.ctx().clone();
         if copy {
             self.copy(&ctx, Picture::Result);
@@ -1462,7 +1633,90 @@ impl OverheadApp {
         if save {
             self.save(&ctx, Picture::Result);
         }
+        if image_on != image_was_on {
+            self.set_image_inference(&ctx, image_on);
+        }
+        if text_on != text_was_on {
+            self.set_text_inference(&ctx, text_on);
+        }
         self.result_view(ui, view);
+        self.inference_overlays(ui, view);
+    }
+
+    /// Over the result view: the image-to-text answer along the top, and in the middle a box per
+    /// request that is running (with a cancel button) or failed.
+    fn inference_overlays(&mut self, ui: &mut Ui, view: Rect) {
+        let inner = view.shrink(VIEW_MARGIN);
+        if !inner.is_positive() {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        if let Task::Done(answer) = &self.text_task {
+            // Below the "FROZEN" label.
+            let top = if self.frozen { 26.0 } else { 0.0 };
+            egui::Area::new(egui::Id::unique("image-to-text answer"))
+                .fixed_pos(inner.left_top() + vec2(0.0, top))
+                .constrain_to(inner)
+                .show(&ctx, |ui| {
+                    let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(10));
+                    frame.show(ui, |ui| {
+                        ui.set_width(inner.width() - 22.0);
+                        ui.horizontal(|ui| {
+                            ui.strong("Image-to-text");
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Copy").on_hover_text("Copy the answer").clicked() {
+                                    ctx.copy_text(answer.clone());
+                                }
+                            });
+                        });
+                        egui::ScrollArea::vertical()
+                            .max_height((inner.height() - top) * 0.4)
+                            .show(ui, |ui| {
+                                // Read-only, but selectable.
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut answer.as_str())
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(1)
+                                        .frame(egui::Frame::NONE),
+                                );
+                            });
+                    });
+                });
+        }
+
+        let shown = [
+            matches!(self.image_task, Task::Running(_) | Task::Failed(_)),
+            matches!(self.text_task, Task::Running(_) | Task::Failed(_)),
+        ];
+        if !shown.contains(&true) {
+            return;
+        }
+        let mut actions = [None, None];
+        egui::Area::new(egui::Id::unique("inference status"))
+            .pivot(Align2::CENTER_CENTER)
+            .fixed_pos(inner.center())
+            .constrain_to(inner)
+            .show(&ctx, |ui| {
+                let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(12));
+                frame.show(ui, |ui| {
+                    ui.set_max_width((inner.width() - 24.0).min(420.0));
+                    actions[0] = task_status(ui, "Image-to-image", &self.image_task);
+                    if shown[0] && shown[1] {
+                        ui.separator();
+                    }
+                    actions[1] = task_status(ui, "Image-to-text", &self.text_task);
+                });
+            });
+        match actions[0] {
+            Some(TaskAction::Retry) => self.set_image_inference(&ctx, true),
+            Some(TaskAction::Stop) => self.set_image_inference(&ctx, false),
+            None => {}
+        }
+        match actions[1] {
+            Some(TaskAction::Retry) => self.set_text_inference(&ctx, true),
+            Some(TaskAction::Stop) => self.set_text_inference(&ctx, false),
+            None => {}
+        }
     }
 
     fn camera_view(&mut self, ui: &mut Ui, rect: Rect) {
@@ -1720,6 +1974,12 @@ impl OverheadApp {
             rect,
             img_rect,
         );
+        if let Task::Done(redrawn) = &self.image_task {
+            // Stretched over the result: the model keeps the composition, but its output size
+            // only roughly has the result's aspect ratio.
+            let tint = Color32::WHITE.gamma_multiply(self.settings.inference.opacity);
+            painter.add(turned_image(redrawn.id(), img_rect, self.image_turn, tint));
+        }
         if response.dragged() && self.result_zoom.zoomed() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         }
@@ -1799,12 +2059,106 @@ fn view_bar(ui: &mut Ui, bar: Rect, name: &str, add_buttons: impl FnOnce(&mut Ui
     });
 }
 
+/// What the user asked of a request in the status box.
+#[derive(Clone, Copy)]
+enum TaskAction {
+    Retry,
+    /// Cancel a running request or dismiss a failed one; either switches the mode off.
+    Stop,
+}
+
+/// A running request with a spinner and a cancel button, or why it failed. Nothing otherwise.
+fn task_status<T, D>(ui: &mut Ui, name: &str, task: &Task<T, D>) -> Option<TaskAction> {
+    let mut action = None;
+    match task {
+        Task::Running(job) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.strong(name);
+                ui.label(format!("{} {} s", job.stage(), job.elapsed().as_secs()));
+            });
+            if ui.button("Cancel").clicked() {
+                action = Some(TaskAction::Stop);
+            }
+        }
+        Task::Failed(error) => {
+            ui.label(
+                RichText::new(format!("{name} failed"))
+                    .strong()
+                    .color(ui.visuals().error_fg_color),
+            );
+            ui.label(error);
+            ui.horizontal(|ui| {
+                if ui.button("Retry").clicked() {
+                    action = Some(TaskAction::Retry);
+                }
+                if ui.button("Close").clicked() {
+                    action = Some(TaskAction::Stop);
+                }
+            });
+        }
+        Task::Off | Task::Done(_) => {}
+    }
+    action
+}
+
+/// A multi-line prompt with a button that restores `default`.
+fn prompt_editor(ui: &mut Ui, id: &str, prompt: &mut String, default: &str) {
+    ui.horizontal(|ui| {
+        ui.label("Prompt");
+        if ui
+            .add_enabled(prompt != default, egui::Button::new("Reset"))
+            .on_hover_text("Restore the default prompt")
+            .clicked()
+        {
+            *prompt = default.to_string();
+        }
+    });
+    ui.add(
+        egui::TextEdit::multiline(prompt)
+            .id_salt(id)
+            .desired_rows(4)
+            .desired_width(f32::INFINITY),
+    );
+}
+
 fn process_settings(s: &Settings) -> ProcessSettings {
     ProcessSettings {
         corners: s.corners,
         sheet: s.sheet.clone(),
         enhance: s.enhance.clone(),
     }
+}
+
+/// A texture drawn into `rect` after turning it by `o`, the way [`RgbImage::oriented`] turns
+/// an image.
+fn turned_image(tex: egui::TextureId, rect: Rect, o: FrameOrientation, tint: Color32) -> Shape {
+    let mut mesh = Mesh::with_texture(tex);
+    for uv in [
+        pos2(0.0, 0.0),
+        pos2(1.0, 0.0),
+        pos2(1.0, 1.0),
+        pos2(0.0, 1.0),
+    ] {
+        let [x, y] = turned_point(o, [uv.x, uv.y]);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.min + vec2(x, y) * rect.size(),
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    Shape::mesh(mesh)
+}
+
+/// Where a normalized image point ends up when the image is turned by `o`.
+fn turned_point(o: FrameOrientation, [x, y]: [f32; 2]) -> [f32; 2] {
+    let mut p = if o.mirror { [1.0 - x, y] } else { [x, y] };
+    for _ in 0..o.quarter_turns % 4 {
+        p = [1.0 - p[1], p[0]];
+    }
+    p
 }
 
 fn unit_uv() -> Rect {
@@ -2050,6 +2404,28 @@ mod tests {
             rotated_corners(corners),
             [[0.125, 0.125], [0.75, 0.125], [0.75, 0.75], [0.125, 0.75]]
         );
+    }
+
+    #[test]
+    fn turned_points_land_on_the_turned_pixels() {
+        // 3×2 image, pixel value = index.
+        let img = RgbImage::from_raw(3, 2, (0..6u8).flat_map(|i| [i; 3]).collect());
+        for quarter_turns in 0..4 {
+            for mirror in [false, true] {
+                let o = FrameOrientation {
+                    quarter_turns,
+                    mirror,
+                };
+                let turned = img.oriented(o);
+                let (w, h) = (turned.width as f32, turned.height as f32);
+                for i in 0..6 {
+                    let center = [(i % 3) as f32 + 0.5, (i / 3) as f32 + 0.5];
+                    let [x, y] = turned_point(o, [center[0] / 3.0, center[1] / 2.0]);
+                    let (tx, ty) = ((x * w) as usize, (y * h) as usize);
+                    assert_eq!(turned.data[(ty * turned.width + tx) * 3], i as u8, "{o:?}");
+                }
+            }
+        }
     }
 
     #[test]

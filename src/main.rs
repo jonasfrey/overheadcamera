@@ -5,6 +5,7 @@ mod camera;
 mod detect;
 mod enhance;
 mod img;
+mod inference;
 mod pipeline;
 mod rtsp;
 mod sheet;

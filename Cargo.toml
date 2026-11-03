@@ -12,10 +12,11 @@ categories = ["multimedia::images", "computer-vision"]
 
 [dependencies]
 arboard = "3.7.0"
+base64 = "0.22"
 chrono = "0.4.45"
 eframe = { version = "0.37.0", features = ["persistence"] }
 futures-util = "0.3.34"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 libc = "0.2.191"
 linuxvideo = "0.3.5"
 openh264 = "0.9.9"
@@ -23,7 +24,9 @@ percent-encoding = "2.3.2"
 rayon = "1.12.0"
 retina = "0.4.21"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
+ureq = { version = "3.5.1", features = ["json"] }
 url = "2.5.8"
 zune-core = "0.5"
 zune-jpeg = "0.5.15"
