@@ -8,10 +8,14 @@
 //! Decoding and stacking keep up with the camera (a 4K MJPEG frame takes ~20 ms to decode, hence
 //! two decoders) so stacking gets every frame; the process thread always works on the newest
 //! stacked frame and skips the ones it is too slow for.
+//!
+//! While the app is paused (its window hidden), frames are dropped before decoding, so the whole
+//! pipeline idles.
 
 use std::{
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     thread::JoinHandle,
@@ -98,6 +102,8 @@ impl Shared {
 pub struct Pipeline {
     shared: Arc<Shared>,
     frame_tx: SyncSender<RawFrame>,
+    /// Shared with the capture, which can skip work of its own (the H.264 decoding).
+    paused: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -128,13 +134,15 @@ impl Pipeline {
         let (frame_tx, frame_rx) = sync_channel(2);
         let (decoded_tx, decoded_rx) = sync_channel(2);
         let frame_rx = Arc::new(Mutex::new(frame_rx));
+        let paused = Arc::new(AtomicBool::new(false));
         let mut threads: Vec<_> = (0..DECODE_THREADS)
             .map(|i| {
                 let shared = shared.clone();
                 let frame_rx = frame_rx.clone();
                 let decoded_tx = decoded_tx.clone();
+                let paused = paused.clone();
                 spawn(&format!("decode{i}"), move || {
-                    decode_thread(&shared, &frame_rx, &decoded_tx)
+                    decode_thread(&shared, &frame_rx, &decoded_tx, &paused)
                 })
             })
             .collect();
@@ -150,6 +158,7 @@ impl Pipeline {
         Self {
             shared,
             frame_tx,
+            paused,
             threads,
         }
     }
@@ -157,6 +166,24 @@ impl Pipeline {
     /// Where capture threads deliver their frames.
     pub fn frame_sink(&self) -> SyncSender<RawFrame> {
         self.frame_tx.clone()
+    }
+
+    /// Set while the pipeline is paused; captures may skip their own work then.
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        self.paused.clone()
+    }
+
+    /// Drops incoming frames undecoded while `paused`; the last images stay. Resuming starts a
+    /// fresh stack, as the sheet may have changed meanwhile.
+    pub fn set_paused(&self, paused: bool) {
+        if self.paused.load(Ordering::Relaxed) == paused {
+            return;
+        }
+        if !paused {
+            // Before frames flow again, so that none gets averaged with the old ones.
+            self.shared.lock().reset_stack = true;
+        }
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
     pub fn set_settings(&self, settings: &ProcessSettings) {
@@ -250,6 +277,7 @@ fn decode_thread(
     shared: &Shared,
     frames: &Mutex<Receiver<RawFrame>>,
     decoded: &SyncSender<(RgbImage, u64)>,
+    paused: &AtomicBool,
 ) {
     loop {
         let received = frames
@@ -290,7 +318,7 @@ fn decode_thread(
             }
             (st.frozen, st.orientation, st.orientation_gen)
         };
-        if frozen {
+        if frozen || paused.load(Ordering::Relaxed) {
             continue;
         }
 
@@ -551,6 +579,48 @@ mod tests {
             ..red
         };
         assert!(decode(&short).is_err());
+    }
+
+    #[test]
+    fn pausing_drops_frames_and_resuming_restarts_the_stack() {
+        let settings = ProcessSettings {
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            sheet: SheetSettings::default(),
+            enhance: EnhanceSettings::default(),
+        };
+        let pipeline = Pipeline::new(egui::Context::default(), settings, 8);
+        let sink = pipeline.frame_sink();
+        let frame = || RawFrame {
+            encoding: Encoding::I420,
+            width: 2,
+            height: 2,
+            bytes_per_line: 2,
+            data: vec![126; 6],
+        };
+        let stacked = || pipeline.stats().stacked_frames;
+        let wait_for = |n: u32| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stacked() != n {
+                assert!(Instant::now() < deadline, "stacked {} instead of {n}", stacked());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        for n in 1..=2 {
+            sink.send(frame()).unwrap();
+            wait_for(n);
+        }
+        pipeline.set_paused(true);
+        assert!(pipeline.pause_flag().load(Ordering::Relaxed));
+        for _ in 0..5 {
+            sink.send(frame()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stacked(), 2);
+
+        pipeline.set_paused(false);
+        sink.send(frame()).unwrap();
+        wait_for(1);
     }
 
     /// Runs real camera frames through the whole pipeline and writes the stacked frame and the

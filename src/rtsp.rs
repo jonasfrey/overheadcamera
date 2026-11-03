@@ -8,7 +8,7 @@
 use std::{
     pin::pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{SyncSender, TrySendError},
     },
@@ -102,8 +102,13 @@ enum Ended {
     Failed(String),
 }
 
-/// Receives the stream, reconnecting whenever it fails, until the capture is dropped.
-pub fn start(settings: StreamSettings, sink: SyncSender<RawFrame>) -> Capture {
+/// Receives the stream, reconnecting whenever it fails, until the capture is dropped. While
+/// `paused` is set the connection stays up, but nothing is decoded.
+pub fn start(
+    settings: StreamSettings,
+    sink: SyncSender<RawFrame>,
+    paused: Arc<AtomicBool>,
+) -> Capture {
     Capture::spawn(move |stop, status| {
         // The worker thread lets retina finish a TEARDOWN in the background after a session ends.
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -119,7 +124,7 @@ pub fn start(settings: StreamSettings, sink: SyncSender<RawFrame>) -> Capture {
             }
         };
         while !stop.load(Ordering::Relaxed) {
-            match runtime.block_on(receive(&settings, &sink, stop, status)) {
+            match runtime.block_on(receive(&settings, &sink, &paused, stop, status)) {
                 Ok(()) | Err(Ended::Stopped) => return,
                 Err(Ended::Failed(e)) => {
                     let mut st = status.lock().unwrap();
@@ -139,6 +144,7 @@ pub fn start(settings: StreamSettings, sink: SyncSender<RawFrame>) -> Capture {
 async fn receive(
     settings: &StreamSettings,
     sink: &SyncSender<RawFrame>,
+    paused: &AtomicBool,
     stop: &AtomicBool,
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), Ended> {
@@ -200,6 +206,13 @@ async fn receive(
             Some(Err(e)) => return Err(failed(&e, settings)),
             None => return Err(Ended::Failed(format!("{host} stopped streaming."))),
         };
+        if paused.load(Ordering::Relaxed) {
+            // Decoding is most of the work. Skipping it breaks the chain of frames that depend
+            // on each other, so decoding resumes at the next key frame.
+            synced = false;
+            deadline = Instant::now() + STALL_TIMEOUT;
+            continue;
+        }
         synced |= frame.is_random_access_point();
         if !synced {
             continue;
@@ -371,7 +384,7 @@ mod tests {
             ..Default::default()
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
-        let capture = start(settings, tx);
+        let capture = start(settings, tx, Default::default());
         let frames = 60;
         let mut first = None;
         for _ in 0..frames {

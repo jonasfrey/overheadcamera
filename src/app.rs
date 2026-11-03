@@ -372,6 +372,8 @@ pub struct OverheadApp {
     result_tex: Option<TextureHandle>,
     result: Option<(Arc<RgbImage>, bool)>,
     frozen: bool,
+    /// Input time of the last frame shown; see `logic`.
+    shown_time: f64,
     /// Corner being dragged and the offset from the pointer to the corner at grab time.
     drag: Option<(usize, Vec2)>,
     selected_corner: Option<usize>,
@@ -412,6 +414,7 @@ impl OverheadApp {
             result_tex: None,
             result: None,
             frozen: false,
+            shown_time: f64::NEG_INFINITY,
             drag: None,
             selected_corner: None,
             placing: Vec::new(),
@@ -528,6 +531,7 @@ impl OverheadApp {
         self.capture = Some(rtsp::start(
             self.settings.stream.clone(),
             self.pipeline.frame_sink(),
+            self.pipeline.pause_flag(),
         ));
     }
 
@@ -1676,8 +1680,21 @@ impl OverheadApp {
 }
 
 impl eframe::App for OverheadApp {
+    /// Pauses the pipeline while the window can't be seen: minimized, on another workspace or,
+    /// if the compositor tells, covered. eframe then skips `ui` and runs only this, with the
+    /// input still that of the last frame shown.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let hidden = ctx.input(|i| i.time) == self.shown_time;
+        self.pipeline.set_paused(hidden);
+        if hidden {
+            // Showing the window again normally brings a new frame by itself; this is a fallback.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.shown_time = ctx.input(|i| i.time);
         self.poll(&ctx);
         self.handle_shortcuts(&ctx);
 
