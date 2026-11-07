@@ -22,8 +22,8 @@ use crate::{
     enhance::{ColorMode, EnhanceSettings},
     img::{FrameOrientation, RgbImage},
     inference::{
-        self, DEFAULT_IMAGE_PROMPT, DEFAULT_TEXT_PROMPT, Finished, InferenceSettings, Resolution,
-        Task,
+        self, DEFAULT_IMAGE_PROMPT, DEFAULT_LOCAL_PROMPT, DEFAULT_TEXT_PROMPT, Finished,
+        ImageBackend, InferenceSettings, LocalWorker, Resolution, Task,
     },
     pipeline::{Pipeline, ProcessSettings},
     rtsp::{self, StreamSettings},
@@ -394,6 +394,8 @@ pub struct OverheadApp {
     image_turn: FrameOrientation,
     /// Image-to-text: the vision model's answer about the result.
     text_task: Task<Finished<String>, String>,
+    /// The local image model's Python process, once image-to-image has run locally.
+    local_worker: LocalWorker,
     status: Option<Status>,
     jobs_tx: Sender<JobResult>,
     jobs_rx: Receiver<JobResult>,
@@ -435,6 +437,7 @@ impl OverheadApp {
             image_task: Task::Off,
             image_turn: FrameOrientation::default(),
             text_task: Task::Off,
+            local_worker: LocalWorker::default(),
             status: None,
             jobs_tx,
             jobs_rx,
@@ -792,6 +795,7 @@ impl OverheadApp {
                 gray,
                 self.settings.inference.image.clone(),
                 expand_home(&self.settings.output_dir),
+                self.local_worker.clone(),
             )),
         };
     }
@@ -1420,50 +1424,180 @@ impl OverheadApp {
     fn inference_section(&mut self, ui: &mut Ui) {
         ui.label(
             RichText::new(
-                "Image-to-image and Image-to-text above the result send the current result to \
-                 these online services and show their answer over it. Keys are stored in plain \
-                 text with the other settings.",
+                "Image-to-image and Image-to-text above the result redraw or describe the \
+                 current result with an AI model and show the answer over it. Image-to-image \
+                 runs online or with a model on this computer; Image-to-text online. Keys are \
+                 stored in plain text with the other settings.",
             )
             .weak(),
         );
         let field_width = ui.available_width() - 90.0;
+        let mut delete_env = false;
         let s = &mut self.settings.inference;
 
         ui.add_space(4.0);
-        ui.label(RichText::new("Image-to-image (fal.ai)").strong());
-        egui::Grid::new("image inference")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("API key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.image.api_key)
-                        .password(true)
-                        .hint_text("or set $FAL_KEY")
-                        .desired_width(field_width),
-                );
-                ui.end_row();
-                ui.label("Model");
-                ui.add(egui::TextEdit::singleline(&mut s.image.model).desired_width(field_width))
-                    .on_hover_text(
-                        "A fal.ai image editing endpoint that takes prompt and image_urls",
-                    );
-                ui.end_row();
-                ui.label("Resolution");
-                ComboBox::from_id_salt("image resolution")
-                    .selected_text(s.image.resolution.label())
-                    .show_ui(ui, |ui| {
-                        for r in Resolution::ALL {
-                            ui.selectable_value(&mut s.image.resolution, r, r.label());
-                        }
+        ui.label(RichText::new("Image-to-image").strong());
+        ui.horizontal(|ui| {
+            ui.label("Run");
+            ComboBox::from_id_salt("image backend")
+                .selected_text(s.image.backend.label())
+                .show_ui(ui, |ui| {
+                    for b in ImageBackend::ALL {
+                        ui.selectable_value(&mut s.image.backend, b, b.label());
+                    }
+                });
+        });
+        match s.image.backend {
+            ImageBackend::Fal => {
+                egui::Grid::new("image inference")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("API key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut s.image.api_key)
+                                .password(true)
+                                .hint_text("or set $FAL_KEY")
+                                .desired_width(field_width),
+                        );
+                        ui.end_row();
+                        ui.label("Model");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut s.image.model)
+                                .desired_width(field_width),
+                        )
+                        .on_hover_text(
+                            "A fal.ai image editing endpoint that takes prompt and image_urls",
+                        );
+                        ui.end_row();
+                        ui.label("Resolution");
+                        ComboBox::from_id_salt("image resolution")
+                            .selected_text(s.image.resolution.label())
+                            .show_ui(ui, |ui| {
+                                for r in Resolution::ALL {
+                                    ui.selectable_value(&mut s.image.resolution, r, r.label());
+                                }
+                            });
+                        ui.end_row();
                     });
-                ui.end_row();
-            });
-        prompt_editor(
-            ui,
-            "image prompt",
-            &mut s.image.prompt,
-            DEFAULT_IMAGE_PROMPT,
-        );
+                prompt_editor(
+                    ui,
+                    "image prompt",
+                    &mut s.image.prompt,
+                    DEFAULT_IMAGE_PROMPT,
+                );
+            }
+            ImageBackend::Local => {
+                let l = &mut s.image.local;
+                ui.label(
+                    RichText::new(
+                        "Runs a Stable Diffusion model through Python on this computer; nothing \
+                         is sent anywhere. The first run sets up a Python environment with \
+                         PyTorch and diffusers and downloads the model (several GB together). \
+                         A GPU makes it fast; on a CPU a run takes minutes.",
+                    )
+                    .weak(),
+                );
+                egui::Grid::new("local inference")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Python");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut l.python)
+                                .hint_text("empty: the app's own environment")
+                                .desired_width(field_width),
+                        )
+                        .on_hover_text(format!(
+                            "Leave empty and the app installs the packages into an environment \
+                             of its own in {}, created with python3; a bare command name such \
+                             as python3.11 creates it with that interpreter instead. Or enter \
+                             the path of an interpreter that has the packages installed, e.g. \
+                             ~/venv/bin/python. Changing it restarts the model.",
+                            self.local_worker.env_dir().display()
+                        ));
+                        ui.end_row();
+                        ui.label("Model");
+                        ui.add(egui::TextEdit::singleline(&mut l.model).desired_width(field_width))
+                            .on_hover_text(
+                                "A Hugging Face model id or a local folder of a diffusers \
+                                 image-to-image pipeline",
+                            );
+                        ui.end_row();
+                        ui.label("Device");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut l.device).desired_width(field_width),
+                        )
+                        .on_hover_text(
+                            "auto picks the GPU if PyTorch sees one; or cuda, cuda:1, mps, \
+                                 cpu",
+                        );
+                        ui.end_row();
+                        ui.label("Size");
+                        ui.add(
+                            Slider::new(&mut l.size, 256..=1024)
+                                .step_by(64.0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "Long side of the image the model works on. SDXL-Turbo is made for \
+                             512; larger is slower and needs more memory.",
+                        );
+                        ui.end_row();
+                        ui.label("Strength");
+                        ui.add(Slider::new(&mut l.strength, 0.1..=0.9).fixed_decimals(2))
+                            .on_hover_text(
+                                "How far the redrawn image may depart from your sketch: low \
+                                 keeps it nearly as it is, high draws a mostly new image",
+                            );
+                        ui.end_row();
+                        ui.label("Steps");
+                        ui.add(Slider::new(&mut l.steps, 1..=20)).on_hover_text(
+                            "Inference steps; Turbo models need few. Raised automatically so \
+                             that steps × strength is at least 1.",
+                        );
+                        ui.end_row();
+                        ui.label("Seed");
+                        ui.add(egui::DragValue::new(&mut l.seed).range(-1..=i64::MAX))
+                            .on_hover_text("-1 picks a new random seed each run");
+                        ui.end_row();
+                    });
+                prompt_editor(ui, "local prompt", &mut l.prompt, DEFAULT_LOCAL_PROMPT);
+                ui.label(
+                    RichText::new("The model reads only the first 77 words or so of the prompt.")
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    let running = self.local_worker.is_running();
+                    if ui
+                        .add_enabled(running, egui::Button::new("Stop local model"))
+                        .on_hover_text(
+                            "End the Python process and free the memory the model takes. The \
+                             next run loads it again.",
+                        )
+                        .clicked()
+                    {
+                        self.local_worker.stop();
+                    }
+                    ui.weak(if running {
+                        "Model process running"
+                    } else {
+                        "Starts with the first run"
+                    });
+                });
+                if self.local_worker.env_exists()
+                    && ui
+                        .button("Delete Python environment")
+                        .on_hover_text(format!(
+                            "Delete {} with the installed packages (a few GB). The next run \
+                             installs them again, e.g. after a graphics driver change. The \
+                             downloaded model stays in the Hugging Face cache.",
+                            self.local_worker.env_dir().display()
+                        ))
+                        .clicked()
+                {
+                    delete_env = true;
+                }
+            }
+        }
 
         ui.add_space(8.0);
         ui.label(RichText::new("Image-to-text (DeepSeek)").strong());
@@ -1485,6 +1619,13 @@ impl OverheadApp {
         ui.checkbox(&mut s.text.thinking, "Think before answering")
             .on_hover_text("More careful answers, but slower and more expensive");
         prompt_editor(ui, "text prompt", &mut s.text.prompt, DEFAULT_TEXT_PROMPT);
+
+        if delete_env {
+            self.image_task = Task::Off;
+            if let Err(e) = self.local_worker.remove_env() {
+                self.set_status(format!("Could not delete the environment: {e}"), true);
+            }
+        }
     }
 
     fn central(&mut self, ui: &mut Ui) {
@@ -2045,6 +2186,12 @@ impl eframe::App for OverheadApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.remember_corners();
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+
+    fn on_exit(&mut self) {
+        // A run in progress is dropped with the app; don't leave Python finishing it.
+        self.image_task = Task::Off;
+        self.local_worker.stop();
     }
 }
 

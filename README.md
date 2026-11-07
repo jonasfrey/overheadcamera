@@ -23,7 +23,7 @@ sharp, evenly lit, and updated with every line you add. When you like what you s
   hand it straight to an AI assistant such as Claude or ChatGPT to discuss it or build on it.
 - **Private and free.** Everything runs on your own computer. No account, no cloud, no subscription,
   and the code is open source. The optional AI redraw and description only send the result to an
-  online service when you switch them on.
+  online service when you switch them on, and the redraw can run on your own machine instead.
 
 ### Made for
 
@@ -149,11 +149,41 @@ Every successful run is kept in the export folder, in a folder named after its s
 Under *Inference* on the left, enter the API key of each service (or set `FAL_KEY` and `DEEPSEEK_API_KEY` before
 starting the app), and change the prompt, the model or the output resolution. Both services charge per request.
 
+#### Redraw on your own computer (local model)
+
+Image-to-image can also run offline with a Stable Diffusion model on your own machine: under *Inference*, set *Run*
+to *Local (Python, SDXL-Turbo)* and switch *Image-to-image* on. Nothing else to install by hand: the first run
+
+1. creates a Python environment of the app's own in `~/.local/share/overheadcamera/venv` (needs Python 3; on Debian
+   or Ubuntu also the `python3-venv` package),
+2. installs PyTorch, [diffusers](https://github.com/huggingface/diffusers) and friends into it (a few GB; without an
+   NVIDIA driver the much smaller CPU-only PyTorch), and
+3. downloads [SDXL-Turbo](https://huggingface.co/stabilityai/sdxl-turbo) (about 7 GB) into the Hugging Face cache.
+
+The progress of each step shows in the box over the result. Later runs only wait for the model to load, once per
+session: the app keeps a small Python worker (`local_img2img.py`, written to `~/.cache/overheadcamera/`) running with
+the model in memory. With an NVIDIA GPU a redraw takes a few seconds; on a CPU, minutes. Nothing leaves your
+computer.
+
+The environment is created with `python3`; a bare command name in the *Python* field, such as `python3.11`, uses
+that interpreter instead. If you'd rather use a Python of your own that already has the packages (`pip install torch
+diffusers transformers accelerate pillow`), enter the path of its interpreter, e.g. `~/venvs/sd/bin/python`; the app
+installs nothing into it. *Delete Python environment* removes the app's own environment, e.g. to reinstall after a
+graphics driver change.
+
+The other settings: *Model* (any diffusers image-to-image model id or local folder), *Device* (`auto`, `cuda`, `mps`
+or `cpu`), *Size* (the long side the model works at; 512 px for SDXL-Turbo), *Strength* (how far the redrawn image
+may depart from your sketch), *Steps*, *Seed* and a short prompt of its own (Stable Diffusion reads only the first 77
+tokens). The local model restyles the drawing more freely than the online one and doesn't preserve handwriting; a low
+strength keeps more of the original. *Stop local model* ends the Python process and frees its memory.
+
+Runs are saved like the online ones, and *Opacity* and the orientation buttons work the same way.
+
 ### Settings
 
 Corners and all settings are saved on exit in `~/.local/share/overheadcamera/app.ron`. Corners are kept per source, so
 switching between the overhead camera and the phone restores each one's crop. The stream password and the API keys
-are stored there in plain text.
+are stored there in plain text. The local model's Python environment lives next to it in `venv`.
 
 ---
 
@@ -178,7 +208,8 @@ even with 4K input.
 | `src/enhance.rs` | lighting correction, levels, sharpening, color modes |
 | `src/detect.rs` | automatic sheet detection |
 | `src/img.rs` | image buffer types |
-| `src/inference.rs` | image-to-image (fal.ai) and image-to-text (DeepSeek) requests |
+| `src/inference.rs` | image-to-image (fal.ai or the local worker) and image-to-text (DeepSeek) |
+| `src/local_img2img.py` | Python worker for the local image model (diffusers), driven over stdin/stdout |
 
 ### Tests
 
@@ -188,6 +219,7 @@ cargo test --release -- --ignored --nocapture camera_smoke   # real camera, writ
 OVERHEAD_TEST_DEVICE=/dev/video2 cargo test --release -- --ignored --nocapture camera_smoke
 OVERHEAD_TEST_RTSP=rtsp://user:pw@192.168.1.52:8554/live cargo test --release -- --ignored --nocapture stream_smoke
 FAL_KEY=… DEEPSEEK_API_KEY=… cargo test -- --ignored --nocapture inference_smoke  # real APIs, costs a little
+cargo test --release -- --ignored --nocapture local_model_smoke     # real local model; installs the environment and downloads SDXL-Turbo
 ```
 
 ## License
